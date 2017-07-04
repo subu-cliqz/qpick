@@ -26,9 +26,6 @@ pub mod merge;
 pub mod builder;
 pub mod stopwords;
 
-extern crate scoped_threadpool;
-use scoped_threadpool::Pool;
-
 macro_rules! make_static_var_and_getter {
     ($fn_name:ident, $var_name:ident, $t:ty) => (
     static mut $var_name: Option<$t> = None;
@@ -109,14 +106,12 @@ fn get_shard_ids(pid: usize,
     Ok(v)
 }
 
-use std::cell::RefCell;
 pub struct Qpick {
     path: String,
     config: config::Config,
     stopwords: HashSet<String>,
     terms_relevance: fst::Map,
-    shards: Arc<Vec<Shard>>,
-    thread_pool: RefCell<Pool>,
+    shards: Vec<Shard>,
 }
 
 pub struct Shard {
@@ -160,15 +155,12 @@ impl Qpick {
             shards.push(Shard{id: i, shard: shard, map: map});
         };
 
-        let mut thread_pool = Pool::new(c.last_shard - c.first_shard);
-
         Qpick {
             config: c,
             path: path,
             stopwords: stopwords,
             terms_relevance: terms_relevance,
-            shards: Arc::new(shards),
-            thread_pool: RefCell::new(thread_pool),
+            shards: shards,
         }
     }
 
@@ -178,47 +170,24 @@ impl Qpick {
 
     fn get_ids(&self, query: String) -> Result<Vec<Vec<(u64, f32)>>, Error> {
 
-        let mut _ids: Arc<Mutex<Vec<Vec<(u64, f32)>>>> = Arc::new(Mutex::new(vec![vec![]; self.config.nr_shards]));
-        let (sender, receiver) = mpsc::channel();
+        let mut _ids: Vec<Vec<(u64, f32)>> = vec![vec![]; self.config.nr_shards];
 
         let ref ngrams: HashMap<String, f32> = ngrams::parse(
             &query, 2, &self.stopwords, &self.terms_relevance, ngrams::ParseMode::Searching);
 
-        self.thread_pool.borrow_mut().scoped(|scoped| {
+        for i in self.config.first_shard..self.config.last_shard {
+            let j = (i - self.config.first_shard) as usize;
 
-            for i in self.config.first_shard..self.config.last_shard {
-                let j = (i - self.config.first_shard) as usize;
-                let ngrams = ngrams.clone();
-                let sender = sender.clone();
-                let _ids = _ids.clone();
-                let shards = self.shards.clone();
-
-                scoped.execute(move || {
-
-                    let sh_ids = match get_shard_ids(j as usize, &ngrams, &shards[j].map, &shards[j].shard) {
-                        Ok(ids) => ids,
-                        Err(_) => {
-                            println!("Failed to retrive ids from shard: {}", i);
-                            vec![]
-                        }
-                    };
-
-                    // obtaining lock might fail! handle it!
-                    let mut _ids = _ids.lock().unwrap();
-                    _ids[i as usize] = sh_ids;
-                    sender.send(()).unwrap();
-                });
-            }
-
-        });
-
-        for _ in self.config.first_shard..self.config.last_shard {
-            receiver.recv().unwrap();
+            let sh_ids = match get_shard_ids(j as usize, &ngrams, &self.shards[j].map, &self.shards[j].shard) {
+                Ok(ids) => ids,
+                Err(_) => {
+                    println!("Failed to retrive ids from shard: {}", i);
+                    vec![]
+                }
+            };
+            _ids[i as usize] = sh_ids;
         }
-
-        // deref MutexGuard returned from _ids.lock().unwrap()
-        let data = (*_ids.lock().unwrap()).clone();
-        Ok(data)
+        Ok(_ids)
     }
 
     pub fn search(&self, query: &str) -> String {
