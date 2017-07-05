@@ -2,9 +2,11 @@ extern crate fst;
 extern crate byteorder;
 extern crate serde_json;
 
+use fst::Regex;
 use std::thread;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::str;
 
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -14,7 +16,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use byteorder::{ByteOrder, LittleEndian};
-use fst::Map;
+use fst::{IntoStreamer, Streamer, Map, MapBuilder};
 use std::io::SeekFrom;
 
 use fst::Error;
@@ -63,42 +65,29 @@ fn read_bucket(mut file: &File, addr: u64, len: u64) -> Vec<(u32, u8)> {
     vector
 }
 
-// reading part
-#[inline]
-fn get_addr_and_len(ngram: &str, pid: usize, map: &fst::Map) -> Option<(u64, u64)> {
-    let ref key = util::ngram2key(ngram, pid as u32);
-    match map.get(key) {
-        Some(val) => {
-            return Some(util::elegant_pair_inv(val))
-        },
-        None => return None,
-    }
-}
-
 fn get_shard_ids(pid: usize,
-                 ngrams: &HashMap<String, f32>,
-                 map: &fst::Map,
+                 vals: &Vec<(u64, f32)>,
                  ifd: &File) -> Result<Vec<(u64, f32)>, Error>{
 
     let mut _ids = HashMap::new();
     let id_size = *get_id_size();
     let n = *get_shard_size() as f32;
-    for (ngram, ntr) in ngrams {
 
-        match get_addr_and_len(ngram, pid, &map) {
-            Some((addr, len)) => {
-                for id_tr in read_bucket(&ifd, addr*id_size as u64, len).iter() {
-                    let qid = util::pqid2qid(id_tr.0 as u64, pid as u64, *get_nr_shards());
-                    let sc = _ids.entry(qid).or_insert(0.0);
-                    // println!("{:?} {:?} {:?}", ngram, qid, sc);
-                    // TODO cosine similarity, normalize ngrams relevance at indexing time
-                    // *sc += weight * ntr;
-                    let mut weight = (id_tr.1 as f32)/100.0 ;
-                    weight = util::max(0.0, ntr - (ntr - weight).abs() as f32);
-                    *sc += weight * (n/len as f32).log(2.0);
-                }
-            },
-            None => (),
+    for val_ntr in vals.iter() {
+
+        let (val, ntr) = *val_ntr;
+
+        let (addr, len) = util::elegant_pair_inv(val);
+
+        for id_tr in read_bucket(&ifd, addr*id_size as u64, len).iter() {
+            let qid = util::pqid2qid(id_tr.0 as u64, pid as u64, *get_nr_shards());
+            let sc = _ids.entry(qid).or_insert(0.0);
+            // println!("{:?} {:?} {:?}", ngram, qid, sc);
+            // TODO cosine similarity, normalize ngrams relevance at indexing time
+            // *sc += weight * ntr;
+            let mut weight = (id_tr.1 as f32)/100.0 ;
+            weight = util::max(0.0, ntr - (ntr - weight).abs() as f32);
+            *sc += weight * (n/len as f32).log(2.0);
         }
     }
 
@@ -114,11 +103,11 @@ pub struct Qpick {
     stopwords: HashSet<String>,
     terms_relevance: fst::Map,
     shards: Vec<Shard>,
+    map: fst::Map,
 }
 
 pub struct Shard {
     id: u32,
-    map: fst::Map,
     shard: File,
 }
 
@@ -145,16 +134,17 @@ impl Qpick {
             Err(_) => panic!("Failed to load terms rel. map: {}!", &c.terms_relevance_path)
         };
 
+
         let mut shards = vec![];
         for i in c.first_shard..c.last_shard {
-            let map_name = format!("{}/map.{}", path, i);
-            let map = match Map::from_path(&map_name) {
-                Ok(map) => map,
-                Err(_) => panic!("Failed to load index map: {}!", &map_name)
-            };
-
             let shard = OpenOptions::new().read(true).open(format!("{}/shard.{}", path, i)).unwrap();
-            shards.push(Shard{id: i, shard: shard, map: map});
+            shards.push(Shard{id: i, shard: shard});
+        };
+
+        let map_name = format!("{}/union_map.{}.fst", path, c.last_shard);
+        let map = match Map::from_path(&map_name) {
+            Ok(map) => map,
+            Err(_) => panic!("Failed to load index map: {}!", &map_name)
         };
 
         Qpick {
@@ -163,6 +153,7 @@ impl Qpick {
             stopwords: stopwords,
             terms_relevance: terms_relevance,
             shards: shards,
+            map: map,
         }
     }
 
@@ -177,18 +168,39 @@ impl Qpick {
         let ref ngrams: HashMap<String, f32> = ngrams::parse(
             &query, 2, &self.stopwords, &self.terms_relevance, ngrams::ParseMode::Searching);
 
-        for i in self.config.first_shard..self.config.last_shard {
-            let j = (i - self.config.first_shard) as usize;
+        // each vector is collection of tuples of (addr, len) pair and ngram's term relevance
+        let ref mut pids2qids: Vec<Vec<(u64, f32)>> = vec![vec![]; self.config.nr_shards];
 
-            let sh_ids = match get_shard_ids(j as usize, &ngrams, &self.shards[j].map, &self.shards[j].shard) {
+        // get ngrams with paired (addr, len) values from the map, group them per shard
+        for (ngram, ntr) in ngrams {
+            let re_str = format!("{}:\\d+", ngram);
+            let re = try!(Regex::new(&re_str));
+            let mut stream = self.map.search(&re).into_stream();
+
+            while let Some((k, v)) = stream.next() {
+                let key = str::from_utf8(&k).unwrap();
+                let (_, pid) = util::key2ngram(key.to_string());
+                pids2qids[pid as usize].push((v, *ntr));
+            }
+        }
+
+        for j in 0..self.config.nr_shards {
+
+            if pids2qids[j].len() == 0 {
+                continue;
+            }
+
+            let sh_ids = match get_shard_ids(j as usize, &pids2qids[j], &self.shards[j].shard) {
                 Ok(ids) => ids,
                 Err(_) => {
-                    println!("Failed to retrive ids from shard: {}", i);
+                    println!("Failed to retrive ids from shard: {}", j);
                     vec![]
                 }
             };
-            _ids[i as usize] = sh_ids;
+
+            _ids[j as usize] = sh_ids;
         }
+
         Ok(_ids)
     }
 
@@ -201,9 +213,9 @@ impl Qpick {
         ids
     }
 
-    pub fn merge(&self) -> Result<(), Error> {
-        println!("Merging index maps from: {:?}", &self.path);
-        merge::merge(&self.path, (self.config.last_shard - self.config.first_shard) as usize)
+    pub fn merge(path: String, nr_shards: usize) -> Result<(), Error> {
+        println!("Merging {:?} index maps from: {:?}", nr_shards, path);
+        merge::merge(&path, nr_shards)
     }
 
 }

@@ -23,10 +23,12 @@ pub fn ngram2key(ngram: &str, shard_id: u32) -> String {
 }
 
 #[inline]
-pub fn key2ngram(key: String) -> String {
-    let mut ngram = key.clone();
-    ngram.truncate(key.rfind(KEY_SEPARATOR).unwrap());
-    ngram
+pub fn key2ngram(key: String) -> (String, u32) {
+    let i = key.rfind(KEY_SEPARATOR).unwrap();
+    let ngram = (&key[..i]).to_string();
+    let pid = &key[i+1..].parse::<u32>().unwrap();
+
+    (ngram, *pid)
 }
 
 

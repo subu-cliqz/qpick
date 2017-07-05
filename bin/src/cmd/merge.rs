@@ -8,15 +8,16 @@ use qpick;
 const USAGE: &'static str = "
 Get vector ids and scores for ANN.
 Usage:
-    qpick merge [options] <path>
+    qpick merge [options] <path> <nr-shards>
     qpick merge --help
 Options:
-    -h, --help  Arg path is a path string.
+    -h, --help  Arg path is a path string. Arg nr-shards is a number of shards to merge.
 ";
 
 #[derive(Debug, RustcDecodable)]
 struct Args {
     arg_path: String,
+    arg_nr_shards: usize,
 }
 
 pub fn run(argv: Vec<String>) -> Result<(), Error> {
@@ -24,8 +25,7 @@ pub fn run(argv: Vec<String>) -> Result<(), Error> {
         .and_then(|d| d.argv(&argv).decode())
         .unwrap_or_else(|e| e.exit());
 
-    let qpick = qpick::Qpick::from_path(args.arg_path);
-    let r = qpick.merge();
+    let r = qpick::Qpick::merge(args.arg_path, args.arg_nr_shards);
     println!("{:?}", r);
 
     Ok(())
