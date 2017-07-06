@@ -5,7 +5,7 @@ extern crate serde_json;
 use fst::Regex;
 use std::thread;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::str;
 
 use std::fs::File;
@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use byteorder::{ByteOrder, LittleEndian};
-use fst::{IntoStreamer, Streamer, Map, MapBuilder};
+use fst::{IntoStreamer, Streamer, Map};
 use std::io::SeekFrom;
 
 use fst::Error;
@@ -53,7 +53,7 @@ fn read_bucket(mut file: &File, addr: u64, len: u64) -> Vec<(u32, u8)> {
     file.seek(SeekFrom::Start(addr)).unwrap();
     let mut handle = file.take((bk_size * id_size) as u64);
     let mut buf=vec![0u8; bk_size*id_size];
-    handle.read(&mut buf);
+    handle.read(&mut buf).unwrap();
 
     let vlen = len as usize;
     let mut vector = Vec::<(u32, u8)>::with_capacity(vlen);
@@ -65,9 +65,8 @@ fn read_bucket(mut file: &File, addr: u64, len: u64) -> Vec<(u32, u8)> {
     vector
 }
 
-fn get_shard_ids(pid: usize,
-                 vals: &Vec<(u64, f32)>,
-                 ifd: &File) -> Result<Vec<(u64, f32)>, Error>{
+fn get_shard_ids(vals: &Vec<(u64, f32)>,
+                 shard: &Shard) -> Result<Vec<(u64, f32)>, Error>{
 
     let mut _ids = HashMap::new();
     let id_size = *get_id_size();
@@ -79,10 +78,9 @@ fn get_shard_ids(pid: usize,
 
         let (addr, len) = util::elegant_pair_inv(val);
 
-        for id_tr in read_bucket(&ifd, addr*id_size as u64, len).iter() {
-            let qid = util::pqid2qid(id_tr.0 as u64, pid as u64, *get_nr_shards());
+        for id_tr in read_bucket(&shard.shard, addr*id_size as u64, len).iter() {
+            let qid = util::pqid2qid(id_tr.0 as u64, shard.id as u64, *get_nr_shards());
             let sc = _ids.entry(qid).or_insert(0.0);
-            // println!("{:?} {:?} {:?}", ngram, qid, sc);
             // TODO cosine similarity, normalize ngrams relevance at indexing time
             // *sc += weight * ntr;
             let mut weight = (id_tr.1 as f32)/100.0 ;
@@ -115,6 +113,7 @@ impl Qpick {
     fn new(path: String) -> Qpick {
 
         let c = config::Config::init();
+
 
         unsafe {
             // TODO set up globals, later should be available via self.config
@@ -161,6 +160,10 @@ impl Qpick {
         Qpick::new(path)
     }
 
+    pub fn get_path(&self) -> &str {
+        &self.path
+    }
+
     fn get_ids(&self, query: String) -> Result<Vec<Vec<(u64, f32)>>, Error> {
 
         let mut _ids: Vec<Vec<(u64, f32)>> = vec![vec![]; self.config.nr_shards];
@@ -190,7 +193,7 @@ impl Qpick {
                 continue;
             }
 
-            let sh_ids = match get_shard_ids(j as usize, &pids2qids[j], &self.shards[j].shard) {
+            let sh_ids = match get_shard_ids(&pids2qids[j], &self.shards[j]) {
                 Ok(ids) => ids,
                 Err(_) => {
                     println!("Failed to retrive ids from shard: {}", j);
@@ -220,6 +223,7 @@ impl Qpick {
 
 }
 
+#[allow(dead_code)]
 fn main() {
 
     let c = config::Config::init();
@@ -252,7 +256,7 @@ fn main() {
 
         thread::spawn(move || {
             builder::build_shard(i, &input_file_name, &tr_map, &stopwords,
-                                 *get_id_size(), *get_bucket_size(), *get_nr_shards());
+                                 *get_id_size(), *get_bucket_size(), *get_nr_shards()).unwrap();
             sender.send(()).unwrap();
         });
     }

@@ -1,18 +1,19 @@
 extern crate fst;
 
 use std::fs;
-use fst::{Map, MapBuilder, Error};
+use fst::{MapBuilder, Error};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::cmp::{Ordering, PartialOrd};
 use std::io::BufWriter;
 use std::fs::OpenOptions;
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::SeekFrom;
 use std::collections::HashSet;
 use std::io::prelude::*;
 
+use std;
 use util;
 use ngrams;
 
@@ -39,14 +40,20 @@ impl PartialOrd for Qid {
     }
 }
 
-fn write_bucket(mut file: &File, addr: u64, data: &Vec<(u32, u8)>, id_size: usize) {
+fn write_bucket(
+    mut file: &File,
+    addr: u64,
+    data: &Vec<(u32, u8)>,
+    id_size: usize) -> Result<(), std::io::Error> {
+
     file.seek(SeekFrom::Start(addr)).unwrap();
     let mut w = Vec::with_capacity(data.len()*id_size);
     for n in data.iter() {
         w.write_u32::<LittleEndian>(n.0).unwrap();
         w.write_u8(n.1).unwrap();
     };
-    file.write_all(w.as_slice());
+
+    file.write_all(w.as_slice())
 }
 
 // build inverted query index, ngram_i -> [q1, q2, ... qi]
@@ -57,13 +64,13 @@ pub fn build_shard(
     stopwords: &HashSet<String>,
     id_size: usize,
     bk_size: usize,
-    nr_shards: usize) -> Result<(), Error>{
+    nr_shards: usize) -> Result<(), Error> {
 
     let mut qcount = 0;
     let mut invert: HashMap<String, BinaryHeap<Qid>> = HashMap::new();
 
     let f = try!(File::open(input_file));
-    let mut reader = BufReader::with_capacity(5 * 1024 * 1024, &f);
+    let reader = BufReader::with_capacity(5 * 1024 * 1024, &f);
     for line in reader.lines() {
 
         let line = match line {
@@ -126,7 +133,7 @@ pub fn build_shard(
         .map(|(key, qids)| (key, qids))
         .collect();
 
-    println!("Sorting keys...");
+    println!("Sorting {} keys...", vinvert.len());
     vinvert.sort_by(|a, b| {a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal)});
 
     // create index dir if it doesn't exist
@@ -134,8 +141,8 @@ pub fn build_shard(
 
     let index_map_file_name = "./index/map.".to_string() + &iid.to_string();
     // remove previous index first if exists
-    fs::remove_file(&index_map_file_name);
-    let mut wtr = BufWriter::new(try!(File::create(&index_map_file_name)));
+    fs::remove_file(&index_map_file_name).unwrap();
+    let wtr = BufWriter::new(try!(File::create(&index_map_file_name)));
 
     println!("Map {} init...", index_map_file_name);
     // Create a builder that can be used to insert new key-value pairs.
@@ -143,7 +150,7 @@ pub fn build_shard(
 
     let index_file_name = "./index/shard.".to_string() + &iid.to_string();
     // remove previous index first if exists
-    fs::remove_file(&index_file_name);
+    fs::remove_file(&index_file_name).unwrap();
     let index_file = &OpenOptions::new()
         .read(true)
         .write(true)
@@ -157,7 +164,7 @@ pub fn build_shard(
             panic!("Error bucket for {:?} is has more than {:?} elements", key, bk_size);
         }
         let ids = qids.iter().map(|qid| (qid.id, qid.sc)).collect::<Vec<(u32, u8)>>();
-        write_bucket(index_file, cursor*id_size as u64, &ids, id_size);
+        write_bucket(index_file, cursor*id_size as u64, &ids, id_size).unwrap();
         build.insert(key, util::elegant_pair(cursor, qids_len)).unwrap();
 
         cursor += qids_len;
