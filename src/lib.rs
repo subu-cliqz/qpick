@@ -28,6 +28,8 @@ pub mod merge;
 pub mod builder;
 pub mod stopwords;
 
+use std::collections::BinaryHeap;
+
 macro_rules! make_static_var_and_getter {
     ($fn_name:ident, $var_name:ident, $t:ty) => (
     static mut $var_name: Option<$t> = None;
@@ -46,6 +48,28 @@ make_static_var_and_getter!(get_id_size, ID_SIZE, usize);
 make_static_var_and_getter!(get_bucket_size, BUCKET_SIZE, usize);
 make_static_var_and_getter!(get_nr_shards, NR_SHARDS, usize);
 make_static_var_and_getter!(get_shard_size, SHARD_SIZE, usize);
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct QpickItem {
+    qid: u64,
+    sc: u32,
+}
+
+// The priority queue depends on `Ord`.
+// Explicitly implement the trait to turn the queue into a min-heap (by default it's a max-heap).
+impl Ord for QpickItem {
+    fn cmp(&self, other: &QpickItem) -> Ordering {
+        other.sc.cmp(&self.sc) // flipped ordering here!
+    }
+}
+
+// `PartialOrd` needs to be implemented as well.
+impl PartialOrd for QpickItem {
+    fn partial_cmp(&self, other: &QpickItem) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 
 fn read_bucket(mut file: &File, addr: u64, len: u64) -> Vec<(u32, u8)> {
     let id_size = get_id_size();
@@ -66,7 +90,8 @@ fn read_bucket(mut file: &File, addr: u64, len: u64) -> Vec<(u32, u8)> {
 }
 
 fn get_shard_ids(vals: &Vec<(u64, f32)>,
-                 shard: &Shard) -> Result<Vec<(u64, f32)>, Error>{
+                 shard: &Shard,
+                 count: Option<usize>) -> Result<Vec<(u64, f32)>, Error>{
 
     let mut _ids = HashMap::new();
     let id_size = *get_id_size();
@@ -91,7 +116,7 @@ fn get_shard_ids(vals: &Vec<(u64, f32)>,
 
     let mut v: Vec<(u64, f32)> = _ids.iter().map(|(id, sc)| (*id, *sc)).collect::<Vec<_>>();
     v.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Less).reverse());
-    v.truncate(100); //TODO put into config
+    v.truncate(count.unwrap_or(100)); //TODO put into config
     Ok(v)
 }
 
@@ -109,11 +134,24 @@ pub struct Shard {
     shard: File,
 }
 
+pub struct QpickResults {
+    items_iter: std::vec::IntoIter<(u64, f32)>,
+}
+
+impl QpickResults {
+    pub fn new(mut items_iter: std::vec::IntoIter<(u64, f32)>) -> QpickResults {
+        QpickResults { items_iter: items_iter }
+    }
+
+    pub fn next(&mut self) -> Option<(u64, f32)> {
+        <std::vec::IntoIter<(u64, f32)> as std::iter::Iterator>::next(&mut self.items_iter)
+    }
+}
+
 impl Qpick {
     fn new(path: String) -> Qpick {
 
         let c = config::Config::init();
-
 
         unsafe {
             // TODO set up globals, later should be available via self.config
@@ -193,7 +231,7 @@ impl Qpick {
                 continue;
             }
 
-            let sh_ids = match get_shard_ids(&pids2qids[j], &self.shards[j]) {
+            let sh_ids = match get_shard_ids(&pids2qids[j], &self.shards[j], None) {
                 Ok(ids) => ids,
                 Err(_) => {
                     println!("Failed to retrive ids from shard: {}", j);
@@ -205,6 +243,73 @@ impl Qpick {
         }
 
         Ok(_ids)
+    }
+
+    pub fn get(&self, query: &str, count: u32) -> QpickResults {
+
+        if query == "" || count == 0 {
+            return QpickResults::new((vec![]).into_iter())
+        }
+
+        let mut _ids: BinaryHeap<QpickItem> = BinaryHeap::new();
+        let ref ngrams: HashMap<String, f32> = ngrams::parse(
+            &query, 2, &self.stopwords, &self.terms_relevance, ngrams::ParseMode::Searching);
+
+        // each vector is collection of tuples of (addr, len) pair and ngram's term relevance
+        let ref mut pids2qids: Vec<Vec<(u64, f32)>> = vec![vec![]; self.config.nr_shards];
+
+        // get ngrams with paired (addr, len) values from the map, group them per shard
+        for (ngram, ntr) in ngrams {
+            let re_str = format!("{}:\\d+", ngram);
+            let re = Regex::new(&re_str).unwrap();
+            let mut stream = self.map.search(&re).into_stream();
+
+            while let Some((k, v)) = stream.next() {
+                let key = str::from_utf8(&k).unwrap();
+                let (_, pid) = util::key2ngram(key.to_string());
+                pids2qids[pid as usize].push((v, *ntr));
+            }
+        }
+
+        let shard_count = match count {
+            1...10 => 10 * count,
+           10...20 =>  5 * count,
+           20...30 =>  3 * count,
+           30...50 =>  2 * count,
+                 _ => count,
+        };
+
+        for j in 0..self.config.nr_shards {
+
+            if pids2qids[j].len() == 0 {
+                continue;
+            }
+
+            let sh_ids = match get_shard_ids(&pids2qids[j], &self.shards[j], Some(shard_count as usize)) {
+                Ok(ids) => ids,
+                Err(_) => {
+                    println!("Failed to retrive ids from shard: {}", j);
+                    vec![]
+                }
+            };
+
+            for sh_id in sh_ids {
+                // rounding to 3 decimal places and casting to u32, because Eq doesn't exist for f32
+                let qpi = QpickItem{qid: sh_id.0, sc: (sh_id.1 * 1000.0).round() as u32};
+
+                if _ids.len() >= count as usize {
+                    let mut min_id = _ids.peek_mut().unwrap();
+                    if qpi < *min_id {
+                        *min_id = qpi
+                    }
+                } else {
+                    _ids.push(qpi);
+                }
+            }
+        }
+
+        let mut ids = _ids.iter().map(|qpi| (qpi.qid, qpi.sc as f32/1000.0)).collect::<Vec<(u64, f32)>>();
+        QpickResults::new(ids.into_iter())
     }
 
     pub fn search(&self, query: &str) -> String {

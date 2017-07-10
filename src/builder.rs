@@ -161,7 +161,7 @@ pub fn build_shard(
     for (key, qids) in vinvert.into_iter() {
         let qids_len: u64 = qids.len() as u64;
         if qids_len > bk_size as u64 {
-            panic!("Error bucket for {:?} is has more than {:?} elements", key, bk_size);
+            panic!("Error bucket for {:?} has more than {:?} elements", key, bk_size);
         }
         let ids = qids.iter().map(|qid| (qid.id, qid.sc)).collect::<Vec<(u32, u8)>>();
         write_bucket(index_file, cursor*id_size as u64, &ids, id_size).unwrap();
