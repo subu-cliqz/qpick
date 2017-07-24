@@ -1,7 +1,7 @@
 qpick
 ===
 
-Search for similar short strings (queries in particular).
+TF-IDF, ngram based, search for similar short strings (queries in particular).
 
 licensed under MIT
 
