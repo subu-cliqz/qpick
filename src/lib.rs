@@ -197,7 +197,6 @@ impl Qpick {
     pub fn from_path(path: String) -> Self {
         Qpick::new(path)
     }
-
     fn get_ids(&self, query: String, count: Option<usize>) -> Result<Vec<(u64, f32)>, Error> {
 
         if query == "" || count == Some(0) || count == None {
@@ -205,10 +204,7 @@ impl Qpick {
         }
 
         let shard_count = match count {
-           Some( 1...10) => 30,
-           Some(10...20) => 50,
-           Some(20...30) => 70,
-           Some(30...50) => 90,
+           Some(1...50) => 100,
                  _ => count.unwrap(),
         };
 
@@ -253,7 +249,11 @@ impl Qpick {
                     };
 
                     // obtaining lock might fail! handle it!
-                    let mut _ids = _ids.lock().unwrap();
+                    let mut _ids = match _ids.lock() {
+                        Ok(_ids) => _ids,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+
                     for (qid, qsc) in sh_ids {
                         // qid is u64, qsc is f32
                         let sc = _ids.entry(qid).or_insert(0.0);
